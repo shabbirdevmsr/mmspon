@@ -1,5 +1,5 @@
 # ==========================================================
-# a.py — multi-BOT, multi-API runner for Railway
+# main.py — multi-BOT, multi-API runner for Railway
 # ==========================================================
 import asyncio
 import logging
@@ -7,28 +7,48 @@ import os
 import time
 from pathlib import Path
 from urllib.parse import quote_plus
+
 import aiohttp
 from dotenv import load_dotenv
 from PIL import Image, ImageFilter
 from pymongo import MongoClient
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, InputFile, ReplyKeyboardRemove, ChatMember
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, InputFile,
+    ReplyKeyboardRemove, ChatMember,
+)
 from telegram.error import TelegramError
-from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandler, ChatMemberHandler, filters
+from telegram.ext import (
+    ApplicationBuilder, MessageHandler, CallbackQueryHandler,
+    ChatMemberHandler, filters,
+)
 
 load_dotenv()
 
 MONGO_URI = f"mongodb://{quote_plus(os.getenv('MONGO_USER', ''))}:{quote_plus(os.getenv('MONGO_PASS', ''))}@{os.getenv('MONGO_HOST', 'localhost')}:{int(os.getenv('MONGO_PORT', '27017'))}/?authSource={os.getenv('MONGO_DB', '')}"
 
-STORAGE, TMP_DIR = Path(__file__).parent / "storage", Path(__file__).parent / "storage" / "tmp"
-STORAGE.mkdir(exist_ok=True); TMP_DIR.mkdir(exist_ok=True)
-UPLOAD_TIMEOUT = 1800; PROGRESS_EDIT_INTERVAL = 2; BLUR_PERCENTAGE = 20
+STORAGE = Path(__file__).parent / "storage"
+TMP_DIR = STORAGE / "tmp"
+STORAGE.mkdir(exist_ok=True)
+TMP_DIR.mkdir(exist_ok=True)
+
+UPLOAD_TIMEOUT = 1800
+PROGRESS_EDIT_INTERVAL = 2
+BLUR_PERCENTAGE = 20
 
 mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
 db = mongo[os.getenv("MONGO_DB", "")]
-users_col, api_col, target_col, welcome_col, tracking_col, adminstate_col, bots_col = db["users"], db["api_sources"], db["api_targets"], db["welcome_settings"], db["api_tracking"], db["admin_state"], db["bots_config"]
+users_col = db["users"]
+api_col = db["api_sources"]
+target_col = db["api_targets"]
+welcome_col = db["welcome_settings"]
+tracking_col = db["api_tracking"]
+adminstate_col = db["admin_state"]
+bots_col = db["bots_config"]
 
 def blog(msg: str):
-    with open(STORAGE / "bot_log.txt", "a", encoding="utf-8") as f: f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    with open(STORAGE / "bot_log.txt", "a", encoding="utf-8") as f: 
+        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
 
 # BOT-SPECIFIC DATABASE HELPERS
 def get_state(bot_id): return (adminstate_col.find_one({"_id": f"state_{bot_id}"}) or {}).get("value", "")
@@ -61,9 +81,19 @@ async def api_get(url):
             async with s.get(url, timeout=60) as r: return await r.json()
     except Exception: return {}
 
+# ==========================================================
+# FILE / DOWNLOAD / UPLOAD HELPERS
+# ==========================================================
 class ProgressFile:
-    def __init__(self, path): self.path = path; self.f = open(path, "rb"); self.total = path.stat().st_size; self.read_bytes = 0
-    def read(self, size=-1): chunk = self.f.read(size); self.read_bytes += len(chunk); return chunk
+    def __init__(self, path): 
+        self.path = path
+        self.f = open(path, "rb")
+        self.total = path.stat().st_size
+        self.read_bytes = 0
+    def read(self, size=-1): 
+        chunk = self.f.read(size)
+        self.read_bytes += len(chunk)
+        return chunk
     def seek(self, *a): return self.f.seek(*a)
     def tell(self): return self.f.tell()
     def close(self): self.f.close()
@@ -121,12 +151,18 @@ async def send_video_with_progress(bot, chat_id, video_path, thumb_path, caption
     try:
         await bot.send_video(chat_id=chat_id, video=InputFile(reader, filename=video_path.name), thumbnail=InputFile(open(thumb_path, "rb"), filename="t.jpg") if thumb_path else None, caption=caption, parse_mode="HTML", protect_content=True, supports_streaming=True, write_timeout=UPLOAD_TIMEOUT, read_timeout=UPLOAD_TIMEOUT)
         return True
-    except TelegramError as e: blog(f"upload {chat_id}: {e}"); return False
+    except TelegramError as e: 
+        blog(f"upload {chat_id}: {e}")
+        return False
     finally:
         stop.set(); task.cancel(); reader.close()
         try: await task
         except asyncio.CancelledError: pass
 
+
+# ==========================================================
+# ADMIN FEATURES & BOT LOGIC
+# ==========================================================
 def extract_status_change(chat_member_update):
     status_change = chat_member_update.difference().get("status")
     old_is_member, new_is_member = chat_member_update.difference().get("is_member", (None, None))
@@ -153,7 +189,6 @@ def admin_keyboard(): return ReplyKeyboardMarkup([[KeyboardButton("📢 Broadcas
 def cancel_keyboard(): return ReplyKeyboardMarkup([[KeyboardButton("❌ Cancel")]], resize_keyboard=True)
 def hidden_keyboard(): return ReplyKeyboardMarkup([[KeyboardButton("↩️ Show Keyboard")]], resize_keyboard=True)
 
-# ----------------- ADMIN FEATURES (ALL RESTORED) -----------------
 async def feat_start(update, ctx, state):
     bot_id = ctx.bot_data.get("bot_id")
     set_state(bot_id, "")
@@ -291,104 +326,107 @@ async def feat_cron_pick(update, ctx, state):
     api_id = cq.data.split("_", 1)[1]
     await cq.message.reply_text(f"⏳ Running cron...")
     bot_id = ctx.bot_data.get("bot_id")
-    
-    # EXACT CRON LOGIC
+    await run_cron(ctx, ctx.bot, cq.message.chat.id, api_id, bot_id)
+
+async def run_cron(ctx, bot, admin_chat_id, api_id, bot_id):
     lock = STORAGE / f"cron_{bot_id}_{api_id}.lock"
     if lock.exists():
         if time.time() - lock.stat().st_mtime < UPLOAD_TIMEOUT:
-            await ctx.bot.send_message(cq.message.chat.id, "⚠️ Cron already running for this API."); return
+            await bot.send_message(admin_chat_id, "⚠️ Cron already running for this API."); return
         lock.unlink()
     lock.write_text(str(os.getpid()))
-    try:
-        api = get_api(api_id, bot_id)
-        if not api: return
-        page = int(api.get("current_page", 1)); mode = api.get("mode", "ON")
-        data = await api_get(f"{api['base_url']}?action={api['home_action']}&page={page}")
-        if not data or not data.get("data"):
-            await ctx.bot.send_message(cq.message.chat.id, f"❌ No videos on page {page}."); return
-        
-        videos = data["data"]; t = get_tracking(api_id); v, idx = None, -1
-        for i in range(len(videos) - 1, -1, -1):
-            slug = str(videos[i].get("slug", videos[i].get("id", "")))
-            if slug and slug not in t["processed_slugs"] and slug not in t["in_progress_slugs"]: v, idx = videos[i], i; break
-            
-        if not v:
-            api_col.update_one({"_id": api_id}, {"$set": {"current_page": max(1, page - 1)}})
-            await ctx.bot.send_message(cq.message.chat.id, f"✅ Page {page} done."); return
-
-        title, slug, thumb_url = esc(v.get("title", v.get("name", "Video"))), str(v.get("slug", v.get("id", ""))), v.get("thumbnail", v.get("image", ""))
-        item = idx + 1
-        
-        t["in_progress_slugs"].append(slug)
-        save_tracking(api_id, t)
-        
-        thumb = await download_thumb(thumb_url)
-        init_text = f"⏳ <b>Cron: {esc(api['name'])}</b>\n\n🎬 <b>{title}</b>\n🆔 <code>{slug}</code>\n📄 Page: {page} | Item: {item}/{len(videos)}\n⚙️ Mode: {mode}"
-        if thumb:
-            init = await ctx.bot.send_photo(cq.message.chat.id, photo=open(thumb, "rb"), caption=init_text, parse_mode="HTML")
-            use_photo = True
-        else:
-            init = await ctx.bot.send_message(cq.message.chat.id, init_text, parse_mode="HTML")
-            use_photo = False
-        msg_id = init.message_id
-        
-        vd = await api_get(f"{api['base_url']}?action={api['video_action']}&id={slug}")
-        link = (vd or {}).get("data", {}).get("downloadLink", "")
-        if not link:
-            await edit_progress(ctx.bot, cq.message.chat.id, msg_id, use_photo, f"❌ No download link for <code>{slug}</code>")
-            t["in_progress_slugs"].remove(slug); t["processed_slugs"].append(slug); save_tracking(api_id, t); cleanup(thumb); return
-            
-        tmp = TMP_DIR / f"cron_{bot_id}_{int(time.time()*1000)}.mp4"
-        async def on_dl(done, ttl):
-            pct = int(done / ttl * 100)
-            await edit_progress(ctx.bot, cq.message.chat.id, msg_id, use_photo, f"📥 <b>Downloading...</b> {pct}%\n\n🎬 <b>{title}</b>\n🆔 <code>{slug}</code>\n📄 Page: {page} | Item: {item}/{len(videos)}\n📦 {round(done/1048576,1)} MB / {round(ttl/1048576,1)} MB")
-            
-        if not await stream_download(link, tmp, on_dl):
-            await edit_progress(ctx.bot, cq.message.chat.id, msg_id, use_photo, f"❌ Download failed for <code>{slug}</code>")
-            t["in_progress_slugs"].remove(slug); save_tracking(api_id, t); cleanup(thumb); return
-        
-        blur = None
-        if thumb:
-            blur = TMP_DIR / f"blur_{bot_id}_{int(time.time()*1000)}.jpg"
-            try: blur_image(thumb, blur, BLUR_PERCENTAGE)
-            except Exception: blur.write_bytes(thumb.read_bytes())
-
-        targets = get_targets(api_id, bot_id)
-        if not targets:
-            await edit_progress(ctx.bot, cq.message.chat.id, msg_id, use_photo, "❌ No channels/groups configured for this API.")
-            t["in_progress_slugs"].remove(slug); save_tracking(api_id, t); cleanup(tmp, thumb, blur); return
-
-        channel_cap = "Join @virulvideopompom 🎬\n\nhttps://t.me/+Uj_xq6904lMzYWVl"
-        group_cap = f"🎬 <b>{title}</b>\n\n🔥 @virulvideopompom"
-        sent_as_video = False
-        
-        if mode == "ON":
-            for tg in targets:
-                cap = channel_cap if tg["type"] == "channel" else group_cap
-                t_thumb = blur if tg["type"] == "channel" else thumb
-                ok = await send_video_with_progress(ctx.bot, tg["chat_id"], tmp, t_thumb, cap, cq.message.chat.id, msg_id, use_photo, tg["type"], title, slug, page, len(videos), item)
-                if ok and tg["type"] == "channel": sent_as_video = True
-                await asyncio.sleep(1)
-
-        if not sent_as_video:
-            await edit_progress(ctx.bot, cq.message.chat.id, msg_id, use_photo, f"⚠️ Falling back to photo/link for <code>{slug}</code>")
-            for tg in targets:
-                try:
-                    if mode == "OFF" and thumb:
-                        await ctx.bot.send_photo(tg["chat_id"], photo=open(thumb, "rb"), caption=group_cap, parse_mode="HTML", protect_content=True)
-                    else:
-                        await ctx.bot.send_message(tg["chat_id"], f"🎬 <b>{title}</b>\n\n📥 {link}\n\n🔥 @virulvideopompom", parse_mode="HTML", protect_content=True)
-                except TelegramError as e: blog(f"fallback {tg['chat_id']}: {e}")
-                await asyncio.sleep(1)
-
-        t["in_progress_slugs"].remove(slug); t["processed_slugs"].append(slug); save_tracking(api_id, t)
-        if len(t["processed_slugs"]) > 3000: t["processed_slugs"].pop(0)
-        
-        cleanup(tmp, thumb, blur)
-        await edit_progress(ctx.bot, cq.message.chat.id, msg_id, use_photo, f"✅ <b>Done!</b>\n\n🎬 <b>{title}</b>\n🆔 <code>{slug}</code>\n📄 Page: {page} | Item: {item}/{len(videos)}\n📤 Sent: {'video' if sent_as_video else 'fallback'}")
+    try: await _cron_pipeline(bot, admin_chat_id, api_id, bot_id)
     finally:
         try: lock.unlink()
         except FileNotFoundError: pass
+
+async def _cron_pipeline(bot, admin_chat_id, api_id, bot_id):
+    api = get_api(api_id, bot_id)
+    if not api: return
+    page = int(api.get("current_page", 1)); mode = api.get("mode", "ON")
+    data = await api_get(f"{api['base_url']}?action={api['home_action']}&page={page}")
+    if not data or not data.get("data"):
+        await bot.send_message(admin_chat_id, f"❌ No videos on page {page}."); return
+    
+    videos = data["data"]; t = get_tracking(api_id); v, idx = None, -1
+    for i in range(len(videos) - 1, -1, -1):
+        slug = str(videos[i].get("slug", videos[i].get("id", "")))
+        if slug and slug not in t["processed_slugs"] and slug not in t["in_progress_slugs"]: v, idx = videos[i], i; break
+        
+    if not v:
+        api_col.update_one({"_id": api_id}, {"$set": {"current_page": max(1, page - 1)}})
+        await bot.send_message(admin_chat_id, f"✅ Page {page} done."); return
+
+    title, slug, thumb_url = esc(v.get("title", v.get("name", "Video"))), str(v.get("slug", v.get("id", ""))), v.get("thumbnail", v.get("image", ""))
+    item = idx + 1
+    
+    t["in_progress_slugs"].append(slug)
+    save_tracking(api_id, t)
+    
+    thumb = await download_thumb(thumb_url)
+    init_text = f"⏳ <b>Cron: {esc(api['name'])}</b>\n\n🎬 <b>{title}</b>\n🆔 <code>{slug}</code>\n📄 Page: {page} | Item: {item}/{len(videos)}\n⚙️ Mode: {mode}"
+    if thumb:
+        init = await bot.send_photo(admin_chat_id, photo=open(thumb, "rb"), caption=init_text, parse_mode="HTML")
+        use_photo = True
+    else:
+        init = await bot.send_message(admin_chat_id, init_text, parse_mode="HTML")
+        use_photo = False
+    msg_id = init.message_id
+    
+    vd = await api_get(f"{api['base_url']}?action={api['video_action']}&id={slug}")
+    link = (vd or {}).get("data", {}).get("downloadLink", "")
+    if not link:
+        await edit_progress(bot, admin_chat_id, msg_id, use_photo, f"❌ No download link for <code>{slug}</code>")
+        t["in_progress_slugs"].remove(slug); t["processed_slugs"].append(slug); save_tracking(api_id, t); cleanup(thumb); return
+        
+    tmp = TMP_DIR / f"cron_{bot_id}_{int(time.time()*1000)}.mp4"
+    async def on_dl(done, ttl):
+        pct = int(done / ttl * 100)
+        await edit_progress(bot, admin_chat_id, msg_id, use_photo, f"📥 <b>Downloading...</b> {pct}%\n\n🎬 <b>{title}</b>\n🆔 <code>{slug}</code>\n📄 Page: {page} | Item: {item}/{len(videos)}\n📦 {round(done/1048576,1)} MB / {round(ttl/1048576,1)} MB")
+        
+    if not await stream_download(link, tmp, on_dl):
+        await edit_progress(bot, admin_chat_id, msg_id, use_photo, f"❌ Download failed for <code>{slug}</code>")
+        t["in_progress_slugs"].remove(slug); save_tracking(api_id, t); cleanup(thumb); return
+    
+    blur = None
+    if thumb:
+        blur = TMP_DIR / f"blur_{bot_id}_{int(time.time()*1000)}.jpg"
+        try: blur_image(thumb, blur, BLUR_PERCENTAGE)
+        except Exception: blur.write_bytes(thumb.read_bytes())
+
+    targets = get_targets(api_id, bot_id)
+    if not targets:
+        await edit_progress(bot, admin_chat_id, msg_id, use_photo, "❌ No channels/groups configured for this API.")
+        t["in_progress_slugs"].remove(slug); save_tracking(api_id, t); cleanup(tmp, thumb, blur); return
+
+    channel_cap = "Join @virulvideopompom 🎬\n\nhttps://t.me/+Uj_xq6904lMzYWVl"
+    group_cap = f"🎬 <b>{title}</b>\n\n🔥 @virulvideopompom"
+    sent_as_video = False
+    
+    if mode == "ON":
+        for tg in targets:
+            cap = channel_cap if tg["type"] == "channel" else group_cap
+            t_thumb = blur if tg["type"] == "channel" else thumb
+            ok = await send_video_with_progress(bot, tg["chat_id"], tmp, t_thumb, cap, admin_chat_id, msg_id, use_photo, tg["type"], title, slug, page, len(videos), item)
+            if ok and tg["type"] == "channel": sent_as_video = True
+            await asyncio.sleep(1)
+
+    if not sent_as_video:
+        await edit_progress(bot, admin_chat_id, msg_id, use_photo, f"⚠️ Falling back to photo/link for <code>{slug}</code>")
+        for tg in targets:
+            try:
+                if mode == "OFF" and thumb:
+                    await bot.send_photo(tg["chat_id"], photo=open(thumb, "rb"), caption=group_cap, parse_mode="HTML", protect_content=True)
+                else:
+                    await bot.send_message(tg["chat_id"], f"🎬 <b>{title}</b>\n\n📥 {link}\n\n🔥 @virulvideopompom", parse_mode="HTML", protect_content=True)
+            except TelegramError as e: blog(f"fallback {tg['chat_id']}: {e}")
+            await asyncio.sleep(1)
+
+    t["in_progress_slugs"].remove(slug); t["processed_slugs"].append(slug); save_tracking(api_id, t)
+    if len(t["processed_slugs"]) > 3000: t["processed_slugs"].pop(0)
+    
+    cleanup(tmp, thumb, blur)
+    await edit_progress(bot, admin_chat_id, msg_id, use_photo, f"✅ <b>Done!</b>\n\n🎬 <b>{title}</b>\n🆔 <code>{slug}</code>\n📄 Page: {page} | Item: {item}/{len(videos)}\n📤 Sent: {'video' if sent_as_video else 'fallback'}")
 
 async def feat_user(update, ctx, state):
     if update.callback_query: return
