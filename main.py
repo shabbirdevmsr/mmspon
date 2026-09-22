@@ -75,7 +75,11 @@ def run_bot(bot_doc):
         )
         register_user_handlers(app, bot_id, db)
         log.info("Starting Telegram bot @%s", bot_doc.get("username", bot_id))
-        app.run_polling(drop_pending_updates=False, allowed_updates=["message", "callback_query"])
+        app.run_polling(
+            drop_pending_updates=False,
+            allowed_updates=["message", "callback_query"],
+            stop_signals=None,
+        )
     except Exception:
         log.exception("Bot %s stopped", bot_id)
 
