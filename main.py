@@ -2,19 +2,19 @@
 """
 vid65 bot — single-file scraper + Telegram control bot.
 
-Flow per page:
-  1. Fetch items from the source API
-  2. Send a progress message: every ID on the page, all marked ⏳
-  3. Process items one by one:
-       download → upload → grab file_id → delete media → save JSON
-       → EDIT the progress message to mark ✅
-  4. When page done: send vid65.json as a document
+One JSON file: vid65.json (cumulative, atomic writes).
+
+Per page:
+  1. Fetch items from source API
+  2. Send progress message: every ID on the page, all ⏳
+  3. One item at a time:
+       download → upload → grab file_id → delete media → append to vid65.json
+       → EDIT progress message to mark ✅
+  4. When page done: send vid65.json (the single, full file)
 
 Auto Mode:
-  Walk pages one after another automatically, same flow per page.
-  Stops at last page, or when Stop Auto is pressed.
-
-State lives in vid65.json (atomic writes).
+  Walk pages one by one automatically. Same flow per page.
+  Stop any time with 🛑 Stop Auto or /stop.
 """
 
 import io
@@ -32,11 +32,7 @@ import requests
 BOT_TOKEN   = "6757665465:AAFHhZ6KjY0B62WpiedvVXRJPxAVLjinC6E"
 ADMIN_ID    = 5087403859
 
-# Where media gets uploaded to obtain file_ids.
-# Leave empty ("") to upload into the admin chat and delete each message right after.
-# Set to a channel id like -1001234567890 to keep media off your chat entirely.
-STORAGE_CHAT_ID = ""
-
+STORAGE_CHAT_ID     = "-1003916426485"      # e.g. "-1001234567890" to hide media from admin chat
 DELETE_AFTER_UPLOAD = True
 
 LOCAL_API   = "https://telegram-bot-api-production-29e4.up.railway.app"
@@ -45,7 +41,7 @@ API_URL     = "https://shabbir.serv00.net/sex/vid65/get.php"
 TOTAL_PAGES = 60
 STATE_FILE  = "vid65.json"
 ITEM_DELAY  = 2.0
-PAGE_DELAY  = 3.0     # pause between pages in auto mode
+PAGE_DELAY  = 3.0
 
 PAGE_FETCH_TIMEOUT = 30
 DOWNLOAD_TIMEOUT   = 120
@@ -61,9 +57,9 @@ logging.basicConfig(
 log = logging.getLogger("vid65")
 
 # ================== RUNTIME FLAGS ==================
-_processing = threading.Event()      # a page is being processed
-_auto_mode  = threading.Event()      # auto mode is running
-_stop_auto  = threading.Event()      # user pressed Stop Auto
+_processing = threading.Event()
+_auto_mode  = threading.Event()
+_stop_auto  = threading.Event()
 
 # ================== STATE ==================
 def load_state() -> Dict[str, Any]:
@@ -178,7 +174,20 @@ def tg_send_document(chat_id: int, path: str, caption: str = "") -> None:
                 raise RuntimeError(res)
     except Exception as e:
         log.warning(f"sendDocument failed: {e}")
-        tg_send(chat_id, f"⚠️ Could not send {path}: <code>{str(e)[:200]}</code>")
+        tg_send(chat_id, f"⚠️ Could not send {os.path.basename(path)}: <code>{str(e)[:200]}</code>")
+
+
+def send_full_file(chat_id: int, caption_prefix: str = "") -> None:
+    """Send the single cumulative vid65.json."""
+    state = load_state()
+    total = len(state.get("items", []))
+    head = f"{caption_prefix}".strip()
+    head = (head + "  ") if head else ""
+    tg_send_document(
+        chat_id, STATE_FILE,
+        caption=(f"{head}📁 <b>{STATE_FILE}</b>\n"
+                 f"Total items: <b>{total}</b>")
+    )
 
 
 def tg_get_updates(offset: Optional[int] = None, timeout: int = 30) -> List[dict]:
@@ -418,8 +427,7 @@ def process_page(chat_id: int, page: int,
 
     if not todo:
         tg_send(chat_id, f"✅ Page {page}: all <b>{len(items)}</b> items already saved.")
-        tg_send_document(chat_id, STATE_FILE,
-                         caption=f"📄 Page {page} — no new items. Full {STATE_FILE}")
+        send_full_file(chat_id, caption_prefix=f"ℹ️ page {page} — no new items")
         return True
 
     ok = 0
@@ -436,7 +444,7 @@ def process_page(chat_id: int, page: int,
 
             state = load_state()
             state["items"].append(row)
-            state["current_page"] = page     # keep cursor aligned
+            state["current_page"] = page
             save_state(state)
 
             status[iid] = {
@@ -456,7 +464,6 @@ def process_page(chat_id: int, page: int,
             tg_edit(chat_id, progress_msg_id,
                     render_progress(page, items, status, len(state["items"]), prefix))
 
-        # small sleep — interruptible
         t = 0.0
         while t < ITEM_DELAY:
             if _stop_auto.is_set() and auto:
@@ -474,14 +481,14 @@ def process_page(chat_id: int, page: int,
         f"🏁 <b>Page {page} complete</b>{tail}\n"
         f"✅ {ok}   ❌ {bad}   💾 total: <b>{len(state['items'])}</b>"
     )
-    tg_send_document(chat_id, STATE_FILE,
-                     caption=f"📄 Page {page} done — full {STATE_FILE}")
+
+    # Send the single cumulative file
+    send_full_file(chat_id, caption_prefix=f"🏁 page {page} done")
 
     return not aborted
 
 # ================== AUTO MODE ==================
 def auto_worker(chat_id: int, start_page: int) -> None:
-    """Walk pages from start_page to TOTAL_PAGES. Stops on Stop Auto."""
     _processing.set()
     _auto_mode.set()
     _stop_auto.clear()
@@ -501,7 +508,6 @@ def auto_worker(chat_id: int, start_page: int) -> None:
                 break
 
             counter += 1
-            # Update cursor in state so a restart resumes here
             state = load_state()
             state["current_page"] = page
             save_state(state)
@@ -516,13 +522,11 @@ def auto_worker(chat_id: int, start_page: int) -> None:
                 log.info(f"Auto mode stopped at page {page}")
                 break
 
-            # Advance cursor
             state = load_state()
             state["current_page"] = min(page + 1, TOTAL_PAGES)
             save_state(state)
 
             page += 1
-            # pause between pages, interruptible
             t = 0.0
             while t < PAGE_DELAY:
                 if _stop_auto.is_set():
@@ -536,13 +540,13 @@ def auto_worker(chat_id: int, start_page: int) -> None:
                     f"🛑 <b>Auto Mode stopped.</b>\n"
                     f"Next page will be <b>{state['current_page']}</b>.\n"
                     f"Total saved: <b>{len(state['items'])}</b>")
+            send_full_file(chat_id, caption_prefix="🛑 auto stopped")
         else:
             tg_send(chat_id,
                     f"🎉 <b>Auto Mode finished.</b>\n"
                     f"Pages processed: <b>{counter}</b>\n"
                     f"Total saved: <b>{len(state['items'])}</b>")
-            tg_send_document(chat_id, STATE_FILE,
-                             caption="🏁 Auto mode complete — final vid65.json")
+            send_full_file(chat_id, caption_prefix="🎉 auto complete")
 
     except Exception as e:
         log.error(f"auto_worker error: {e}", exc_info=True)
@@ -551,7 +555,6 @@ def auto_worker(chat_id: int, start_page: int) -> None:
         _auto_mode.clear()
         _processing.clear()
         _stop_auto.clear()
-        # refresh menu so button states reflect reality
         try:
             send_menu(chat_id)
         except Exception:
@@ -579,10 +582,6 @@ def menu_keyboard(page: int) -> dict:
          {"text": "🚀 Auto Mode", "callback_data": "auto:start"},
          {"text": "📊 Status", "callback_data": "action:status"}]
     )
-    row3 = (
-        [{"text": "📁 Send JSON", "callback_data": "action:json"}]
-        if auto_running else []
-    )
     rows = [
         [
             {"text": "⬅️ Prev", "callback_data": "nav:prev"},
@@ -591,8 +590,8 @@ def menu_keyboard(page: int) -> dict:
         ],
         row2,
     ]
-    if row3:
-        rows.append(row3)
+    if not auto_running:
+        rows.append([{"text": "📁 Send JSON", "callback_data": "action:json"}])
     return {"inline_keyboard": rows}
 
 
@@ -619,8 +618,7 @@ def menu_text(state: Dict[str, Any]) -> str:
         f"✅ Items saved:   <b>{n}</b>\n"
         f"🗄 Upload target: <code>{storage}</code>\n"
         f"🕒 Last update:   <b>{last}</b>\n\n"
-        f"<i>Auto Mode walks pages {page}→{TOTAL_PAGES}, one item at a time.\n"
-        f"Tap 🛑 Stop Auto at any time — the current item finishes first.</i>"
+        f"<i>After each page: bot sends {STATE_FILE} (all data, one file).</i>"
     )
 
 
@@ -670,7 +668,7 @@ def handle_message(msg: dict) -> None:
     elif text.startswith("/status"):
         tg_send(chat_id, menu_text(load_state()))
     elif text.startswith("/json"):
-        tg_send_document(chat_id, STATE_FILE, caption=f"📁 Current {STATE_FILE}")
+        send_full_file(chat_id, caption_prefix="📁 on demand")
     elif text.startswith("/auto"):
         parts = text.split()
         state = load_state()
@@ -705,7 +703,7 @@ def handle_message(msg: dict) -> None:
                 "Commands:\n"
                 "/start — show menu\n"
                 "/status — show stats\n"
-                "/json — send current vid65.json\n"
+                "/json — send vid65.json\n"
                 "/process [N] — process page N (default: current)\n"
                 "/auto [N] — start Auto Mode from page N (default: current)\n"
                 "/stop — stop Auto Mode\n"
@@ -783,7 +781,7 @@ def handle_callback(cb: dict) -> None:
 
     elif data == "action:json":
         tg_answer_cb(cb_id, "Sending file…")
-        tg_send_document(chat_id, STATE_FILE, caption=f"📁 {STATE_FILE}")
+        send_full_file(chat_id, caption_prefix="📁 on demand")
 
     else:
         tg_answer_cb(cb_id)
