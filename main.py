@@ -2,15 +2,14 @@
 """
 vid65 bot — single-file scraper + Telegram control bot.
 
-Runs on your PC. Long-polls the local Bot API server.
-Press "Next & Process" to download + upload every item on the next page,
-one at a time, with a delay.
-
 Flow per page:
-  1. Send a progress message: every ID on the page, all marked ⏳
-  2. Process items one by one; after each, EDIT that message to mark ✅
-  3. When page done: send vid65.json as a document
-  4. Move on to the next page (same flow)
+  1. Fetch items from the source API
+  2. Send a progress message: every ID on the page, all marked ⏳
+  3. Process items one by one:
+       download → upload to local Bot API server → get file_id → save to JSON
+       → DELETE the media message (so nothing stays in admin chat)
+       → EDIT the progress message to mark ✅
+  4. When page done: send vid65.json as a document
 
 State lives in vid65.json (atomic writes).
 """
@@ -29,7 +28,14 @@ import requests
 # ================== CONFIG ==================
 BOT_TOKEN   = "6757665465:AAFHhZ6KjY0B62WpiedvVXRJPxAVLjinC6E"
 ADMIN_ID    = 5087403859
-CHAT_ID     = ADMIN_ID
+
+# Where media gets uploaded to obtain file_ids.
+# Leave empty ("") to upload into the admin chat and delete each message right after.
+# Set to a channel id like -1001234567890 to keep media off your chat entirely.
+STORAGE_CHAT_ID = ""
+
+# If STORAGE_CHAT_ID is empty, delete the media message right after grabbing file_id.
+DELETE_AFTER_UPLOAD = True
 
 LOCAL_API   = "https://telegram-bot-api-production-29e4.up.railway.app"
 API_URL     = "https://shabbir.serv00.net/sex/vid65/get.php"
@@ -106,8 +112,16 @@ def tg_send(chat_id, text: str, reply_markup: Optional[dict] = None):
         return None
 
 
+def tg_delete(chat_id, message_id: int) -> None:
+    try:
+        tg("deleteMessage",
+           data={"chat_id": chat_id, "message_id": message_id},
+           timeout=15)
+    except Exception as e:
+        log.debug(f"deleteMessage failed: {e}")
+
+
 def tg_edit(chat_id, message_id, text: str, reply_markup: Optional[dict] = None) -> bool:
-    """Edit text; retries on 429. Returns True if the edit succeeded."""
     data = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -122,7 +136,6 @@ def tg_edit(chat_id, message_id, text: str, reply_markup: Optional[dict] = None)
             r = requests.post(_url("editMessageText"), data=data, timeout=30)
             if r.status_code == 429:
                 retry = r.json().get("parameters", {}).get("retry_after", 2)
-                log.warning(f"edit rate-limited; sleeping {retry}s")
                 time.sleep(retry + 0.5)
                 continue
             r.raise_for_status()
@@ -143,15 +156,12 @@ def tg_answer_cb(cb_id: str, text: str = ""):
 
 
 def tg_send_document(chat_id: int, path: str, caption: str = "") -> None:
-    """Upload a local file as a Telegram document."""
     try:
         with open(path, "rb") as f:
             files = {"document": (os.path.basename(path), f)}
-            data = {
-                "chat_id": chat_id,
-                "caption": caption[:1024],
-                "parse_mode": "HTML",
-            }
+            data = {"chat_id": chat_id,
+                    "caption": caption[:1024],
+                    "parse_mode": "HTML"}
             r = requests.post(_url("sendDocument"),
                               files=files, data=data, timeout=None)
             r.raise_for_status()
@@ -220,17 +230,31 @@ def fetch_page(page: int) -> List[dict]:
     return data.get("data", [])
 
 # ================== UPLOAD ==================
+def _target_chat() -> int:
+    """Where the media gets sent to obtain a file_id."""
+    return int(STORAGE_CHAT_ID) if STORAGE_CHAT_ID else ADMIN_ID
+
+
+def _should_delete() -> bool:
+    return (not STORAGE_CHAT_ID) and DELETE_AFTER_UPLOAD
+
+
 def upload_photo(image_bytes: bytes, filename: str, caption: str):
+    """Returns (file_id, message_id). Deletes the message if configured."""
     for i in range(1, UPLOAD_RETRIES + 1):
         try:
             files = {"photo": (filename, image_bytes)}
-            data = {"chat_id": CHAT_ID, "caption": caption[:1024]}
+            data = {"chat_id": _target_chat(), "caption": caption[:1024]}
             r = requests.post(_url("sendPhoto"), files=files, data=data, timeout=None)
             r.raise_for_status()
             res = r.json()
             if not res.get("ok"):
                 raise RuntimeError(res)
-            return res["result"]["photo"][-1]["file_id"], res["result"]["message_id"]
+            msg_id = res["result"]["message_id"]
+            fid = res["result"]["photo"][-1]["file_id"]
+            if _should_delete():
+                tg_delete(_target_chat(), msg_id)
+            return fid, msg_id
         except Exception as e:
             log.warning(f"upload_photo try {i}/{UPLOAD_RETRIES} failed: {e}")
             if i == UPLOAD_RETRIES:
@@ -239,10 +263,11 @@ def upload_photo(image_bytes: bytes, filename: str, caption: str):
 
 
 def upload_video(video_bytes: bytes, filename: str, caption: str):
+    """Returns (file_id, message_id). Deletes the message if configured."""
     for i in range(1, UPLOAD_RETRIES + 1):
         try:
             files = {"video": (filename, video_bytes)}
-            data = {"chat_id": CHAT_ID,
+            data = {"chat_id": _target_chat(),
                     "caption": caption[:1024],
                     "supports_streaming": "true"}
             r = requests.post(_url("sendVideo"), files=files, data=data, timeout=None)
@@ -259,7 +284,10 @@ def upload_video(video_bytes: bytes, filename: str, caption: str):
                 fid = result["animation"]["file_id"]
             else:
                 raise RuntimeError(f"no video/document in response: {result}")
-            return fid, result["message_id"]
+            msg_id = result["message_id"]
+            if _should_delete():
+                tg_delete(_target_chat(), msg_id)
+            return fid, msg_id
         except Exception as e:
             log.warning(f"upload_video try {i}/{UPLOAD_RETRIES} failed: {e}")
             if i == UPLOAD_RETRIES:
@@ -283,10 +311,10 @@ def process_item(item: dict, page: int) -> dict:
     video_bytes = download_bytes(video_url)
     size_mb = round(len(video_bytes) / 1e6, 2)
 
-    log.info(f"[{item_id}] uploading image…")
+    log.info(f"[{item_id}] uploading image (temp)…")
     image_id, image_msg = upload_photo(image_bytes, img_name, name)
 
-    log.info(f"[{item_id}] uploading video ({size_mb} MB)…")
+    log.info(f"[{item_id}] uploading video ({size_mb} MB, temp)…")
     video_id, video_msg = upload_video(video_bytes, vid_name, name)
 
     return {
@@ -296,7 +324,7 @@ def process_item(item: dict, page: int) -> dict:
         "video_id": video_id,
         "image_msg_id": image_msg,
         "video_msg_id": video_msg,
-        "chat_id": CHAT_ID,
+        "chat_id": _target_chat(),
         "size_mb": size_mb,
         "page": page,
         "create_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -307,13 +335,6 @@ def process_item(item: dict, page: int) -> dict:
 def render_progress(page: int, items: List[dict],
                     status: Dict[int, dict],
                     total_saved: int) -> str:
-    """
-    status[item_id] = {"state": "pending"|"done"|"failed",
-                       "size_mb": float|None,
-                       "image_id": str|None,
-                       "video_id": str|None,
-                       "error": str|None}
-    """
     done_n = sum(1 for v in status.values() if v["state"] == "done")
     fail_n = sum(1 for v in status.values() if v["state"] == "failed")
     total_n = len(items)
@@ -336,7 +357,7 @@ def render_progress(page: int, items: List[dict],
                 f"🖼 <code>{(st.get('image_id') or '')[:12]}…</code>  "
                 f"🎬 <code>{(st.get('video_id') or '')[:12]}…</code>"
             )
-        else:  # failed
+        else:
             lines.append(
                 f"❌ <code>{iid}</code>  {it['name'][:48]}\n"
                 f"    <i>{(st.get('error') or 'error')[:120]}</i>"
@@ -361,7 +382,6 @@ def process_page(chat_id: int, page: int) -> None:
         tg_send(chat_id, f"⚠️ Page {page} returned no items.")
         return
 
-    # Build per-item status
     status: Dict[int, dict] = {}
     for it in items:
         iid = int(it["id"])
@@ -371,12 +391,9 @@ def process_page(chat_id: int, page: int) -> None:
         else:
             status[iid] = {"state": "pending"}
 
-    # Send the progress message
     total_saved_now = len(state["items"])
     text = render_progress(page, items, status, total_saved_now)
     progress_msg_id = tg_send(chat_id, text)
-    if progress_msg_id is None:
-        log.warning("could not send progress message; continuing silently")
 
     todo = [it for it in items if status[int(it["id"])]["state"] == "pending"]
 
@@ -393,7 +410,6 @@ def process_page(chat_id: int, page: int) -> None:
         try:
             row = process_item(item, page)
 
-            # Save immediately
             state = load_state()
             state["items"].append(row)
             save_state(state)
@@ -410,7 +426,6 @@ def process_page(chat_id: int, page: int) -> None:
             log.error(f"item {iid} failed: {e}", exc_info=True)
             status[iid] = {"state": "failed", "error": str(e)[:250]}
 
-        # Edit the progress message
         state = load_state()
         if progress_msg_id is not None:
             tg_edit(chat_id, progress_msg_id,
@@ -418,7 +433,6 @@ def process_page(chat_id: int, page: int) -> None:
 
         time.sleep(ITEM_DELAY)
 
-    # Page done — send JSON file
     state = load_state()
     tg_send(
         chat_id,
@@ -451,14 +465,15 @@ def menu_text(state: Dict[str, Any]) -> str:
     n = len(state.get("items", []))
     last = state.get("updated_at") or "—"
     busy = " 🟡 (processing…)" if _processing.is_set() else ""
+    storage = STORAGE_CHAT_ID or f"admin chat (auto-deleted)" if DELETE_AFTER_UPLOAD else "admin chat"
     return (
         f"🤖 <b>vid65 Scraper Bot</b>{busy}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📄 Current page:  <b>{page}</b> / {TOTAL_PAGES}\n"
         f"✅ Items saved:   <b>{n}</b>\n"
+        f"🗄 Upload target: <code>{storage}</code>\n"
         f"🕒 Last update:   <b>{last}</b>\n\n"
-        f"<i>Next &amp; Process → downloads + uploads every item on the next page, "
-        f"one at a time, and sends {STATE_FILE} when the page finishes.</i>"
+        f"<i>Media is uploaded only to obtain file_ids — nothing is kept in chat.</i>"
     )
 
 
@@ -507,8 +522,7 @@ def handle_message(msg: dict) -> None:
     elif text.startswith("/status"):
         tg_send(chat_id, menu_text(load_state()))
     elif text.startswith("/json"):
-        tg_send_document(chat_id, STATE_FILE,
-                         caption=f"📁 Current {STATE_FILE}")
+        tg_send_document(chat_id, STATE_FILE, caption=f"📁 Current {STATE_FILE}")
     elif text.startswith("/process"):
         parts = text.split()
         if len(parts) == 2 and parts[1].isdigit():
@@ -618,6 +632,13 @@ def main() -> None:
         raise SystemExit("ADMIN_ID is empty")
 
     verify_token()
+
+    if STORAGE_CHAT_ID:
+        log.info(f"Storage chat: {STORAGE_CHAT_ID} (media won't touch admin chat)")
+    elif DELETE_AFTER_UPLOAD:
+        log.info("No storage chat set — media will be uploaded to admin chat then deleted")
+    else:
+        log.info("⚠️ Media will stay in admin chat (DELETE_AFTER_UPLOAD=False)")
 
     state = load_state()
     log.info(f"Loaded state: page={state['current_page']}  items={len(state['items'])}")
