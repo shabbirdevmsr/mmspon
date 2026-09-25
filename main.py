@@ -2,11 +2,17 @@
 """
 vid65 bot — single-file scraper + Telegram control bot.
 
-Runs on your PC. Long-polls the local Bot API server for admin commands.
+Runs on your PC. Long-polls the local Bot API server.
 Press "Next & Process" to download + upload every item on the next page,
-one at a time, with a delay. Everything is saved to vid65.json after each item.
+one at a time, with a delay.
 
-Author: you
+Flow per page:
+  1. Send a progress message: every ID on the page, all marked ⏳
+  2. Process items one by one; after each, EDIT that message to mark ✅
+  3. When page done: send vid65.json as a document
+  4. Move on to the next page (same flow)
+
+State lives in vid65.json (atomic writes).
 """
 
 import io
@@ -23,14 +29,14 @@ import requests
 # ================== CONFIG ==================
 BOT_TOKEN   = "6757665465:AAFHhZ6KjY0B62WpiedvVXRJPxAVLjinC6E"
 ADMIN_ID    = 5087403859
-CHAT_ID     = ADMIN_ID     # where the media is uploaded (admin's chat)
+CHAT_ID     = ADMIN_ID
 
 LOCAL_API   = "https://telegram-bot-api-production-29e4.up.railway.app"
 API_URL     = "https://shabbir.serv00.net/sex/vid65/get.php"
 
 TOTAL_PAGES = 60
 STATE_FILE  = "vid65.json"
-ITEM_DELAY  = 2.0          # seconds between items
+ITEM_DELAY  = 2.0
 
 PAGE_FETCH_TIMEOUT = 30
 DOWNLOAD_TIMEOUT   = 120
@@ -66,7 +72,7 @@ def save_state(s: Dict[str, Any]) -> None:
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_FILE)   # atomic
+    os.replace(tmp, STATE_FILE)
 
 
 def done_ids(state: Dict[str, Any]) -> set:
@@ -93,13 +99,15 @@ def tg_send(chat_id, text: str, reply_markup: Optional[dict] = None):
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
     try:
-        return tg("sendMessage", data=data, timeout=30)
+        res = tg("sendMessage", data=data, timeout=30)
+        return res["result"]["message_id"] if res.get("ok") else None
     except Exception as e:
         log.warning(f"sendMessage failed: {e}")
         return None
 
 
-def tg_edit(chat_id, message_id, text: str, reply_markup: Optional[dict] = None):
+def tg_edit(chat_id, message_id, text: str, reply_markup: Optional[dict] = None) -> bool:
+    """Edit text; retries on 429. Returns True if the edit succeeded."""
     data = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -109,22 +117,55 @@ def tg_edit(chat_id, message_id, text: str, reply_markup: Optional[dict] = None)
     }
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
-    try:
-        return tg("editMessageText", data=data, timeout=30)
-    except Exception as e:
-        log.debug(f"editMessageText failed: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            r = requests.post(_url("editMessageText"), data=data, timeout=30)
+            if r.status_code == 429:
+                retry = r.json().get("parameters", {}).get("retry_after", 2)
+                log.warning(f"edit rate-limited; sleeping {retry}s")
+                time.sleep(retry + 0.5)
+                continue
+            r.raise_for_status()
+            return True
+        except Exception as e:
+            log.debug(f"editMessageText failed (try {attempt+1}): {e}")
+            time.sleep(1)
+    return False
 
 
 def tg_answer_cb(cb_id: str, text: str = ""):
     try:
-        tg("answerCallbackQuery", data={"callback_query_id": cb_id, "text": text[:200]}, timeout=15)
+        tg("answerCallbackQuery",
+           data={"callback_query_id": cb_id, "text": text[:200]},
+           timeout=15)
     except Exception:
         pass
 
 
+def tg_send_document(chat_id: int, path: str, caption: str = "") -> None:
+    """Upload a local file as a Telegram document."""
+    try:
+        with open(path, "rb") as f:
+            files = {"document": (os.path.basename(path), f)}
+            data = {
+                "chat_id": chat_id,
+                "caption": caption[:1024],
+                "parse_mode": "HTML",
+            }
+            r = requests.post(_url("sendDocument"),
+                              files=files, data=data, timeout=None)
+            r.raise_for_status()
+            res = r.json()
+            if not res.get("ok"):
+                raise RuntimeError(res)
+    except Exception as e:
+        log.warning(f"sendDocument failed: {e}")
+        tg_send(chat_id, f"⚠️ Could not send {path}: <code>{str(e)[:200]}</code>")
+
+
 def tg_get_updates(offset: Optional[int] = None, timeout: int = 30) -> List[dict]:
-    params = {"timeout": timeout, "allowed_updates": '["message","callback_query"]'}
+    params = {"timeout": timeout,
+              "allowed_updates": '["message","callback_query"]'}
     if offset is not None:
         params["offset"] = offset
     r = requests.get(_url("getUpdates"), params=params, timeout=timeout + 10)
@@ -137,7 +178,10 @@ def verify_token() -> None:
         r = requests.get(_url("getMe"), timeout=15)
     except Exception as e:
         raise SystemExit(f"Can't reach local Bot API server: {e}")
-    body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    try:
+        body = r.json()
+    except Exception:
+        raise SystemExit(f"Local server returned non-JSON: {r.text[:200]}")
     if r.status_code != 200 or not body.get("ok"):
         raise SystemExit(f"Bot token rejected: HTTP {r.status_code} — {r.text[:300]}")
     me = body["result"]
@@ -167,7 +211,8 @@ def download_bytes(url: str, retries: int = DOWNLOAD_RETRIES) -> bytes:
 def fetch_page(page: int) -> List[dict]:
     r = requests.get(API_URL, params={"page": page},
                      timeout=PAGE_FETCH_TIMEOUT,
-                     headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+                     headers={"User-Agent": "Mozilla/5.0",
+                              "Accept": "application/json"})
     r.raise_for_status()
     data = r.json()
     if not data.get("success"):
@@ -197,7 +242,9 @@ def upload_video(video_bytes: bytes, filename: str, caption: str):
     for i in range(1, UPLOAD_RETRIES + 1):
         try:
             files = {"video": (filename, video_bytes)}
-            data = {"chat_id": CHAT_ID, "caption": caption[:1024], "supports_streaming": "true"}
+            data = {"chat_id": CHAT_ID,
+                    "caption": caption[:1024],
+                    "supports_streaming": "true"}
             r = requests.post(_url("sendVideo"), files=files, data=data, timeout=None)
             r.raise_for_status()
             res = r.json()
@@ -256,12 +303,54 @@ def process_item(item: dict, page: int) -> dict:
     }
 
 
+# ---------- progress message rendering ----------
+def render_progress(page: int, items: List[dict],
+                    status: Dict[int, dict],
+                    total_saved: int) -> str:
+    """
+    status[item_id] = {"state": "pending"|"done"|"failed",
+                       "size_mb": float|None,
+                       "image_id": str|None,
+                       "video_id": str|None,
+                       "error": str|None}
+    """
+    done_n = sum(1 for v in status.values() if v["state"] == "done")
+    fail_n = sum(1 for v in status.values() if v["state"] == "failed")
+    total_n = len(items)
+
+    lines = [
+        f"📄 <b>Page {page}</b>  —  {done_n}/{total_n} done"
+        + (f"  (❌ {fail_n})" if fail_n else ""),
+        "━━━━━━━━━━━━━━━",
+    ]
+
+    for it in items:
+        iid = int(it["id"])
+        st = status.get(iid, {"state": "pending"})
+        if st["state"] == "pending":
+            lines.append(f"⏳ <code>{iid}</code>  {it['name'][:48]}")
+        elif st["state"] == "done":
+            lines.append(
+                f"✅ <code>{iid}</code>  {it['name'][:48]}\n"
+                f"    📦 {st.get('size_mb')} MB  "
+                f"🖼 <code>{(st.get('image_id') or '')[:12]}…</code>  "
+                f"🎬 <code>{(st.get('video_id') or '')[:12]}…</code>"
+            )
+        else:  # failed
+            lines.append(
+                f"❌ <code>{iid}</code>  {it['name'][:48]}\n"
+                f"    <i>{(st.get('error') or 'error')[:120]}</i>"
+            )
+
+    lines.append("━━━━━━━━━━━━━━━")
+    lines.append(f"💾 Total saved in {STATE_FILE}: <b>{total_saved}</b>")
+    return "\n".join(lines)
+
+
 def process_page(chat_id: int, page: int) -> None:
-    """Download + upload every new item on `page`, one at a time."""
     state = load_state()
     seen = done_ids(state)
 
-    tg_send(chat_id, f"⬇️ Fetching page <b>{page}</b>…")
     try:
         items = fetch_page(page)
     except Exception as e:
@@ -272,40 +361,72 @@ def process_page(chat_id: int, page: int) -> None:
         tg_send(chat_id, f"⚠️ Page {page} returned no items.")
         return
 
-    todo = [it for it in items if int(it["id"]) not in seen]
+    # Build per-item status
+    status: Dict[int, dict] = {}
+    for it in items:
+        iid = int(it["id"])
+        if iid in seen:
+            status[iid] = {"state": "done", "size_mb": None,
+                           "image_id": None, "video_id": None}
+        else:
+            status[iid] = {"state": "pending"}
+
+    # Send the progress message
+    total_saved_now = len(state["items"])
+    text = render_progress(page, items, status, total_saved_now)
+    progress_msg_id = tg_send(chat_id, text)
+    if progress_msg_id is None:
+        log.warning("could not send progress message; continuing silently")
+
+    todo = [it for it in items if status[int(it["id"])]["state"] == "pending"]
+
     if not todo:
         tg_send(chat_id, f"✅ Page {page}: all <b>{len(items)}</b> items already saved.")
+        tg_send_document(chat_id, STATE_FILE,
+                         caption=f"📄 Page {page} — no new items. Full {STATE_FILE}")
         return
-
-    tg_send(chat_id,
-            f"▶️ Page <b>{page}</b> — processing <b>{len(todo)}</b> new item(s).\n"
-            f"Delay between items: <b>{ITEM_DELAY}s</b>")
 
     ok = 0
     bad = 0
     for idx, item in enumerate(todo, 1):
-        item_id = int(item["id"])
+        iid = int(item["id"])
         try:
             row = process_item(item, page)
+
+            # Save immediately
             state = load_state()
             state["items"].append(row)
             save_state(state)
+
+            status[iid] = {
+                "state": "done",
+                "size_mb": row["size_mb"],
+                "image_id": row["image_id"],
+                "video_id": row["video_id"],
+            }
             ok += 1
-            tg_send(
-                chat_id,
-                f"✅ <b>{idx}/{len(todo)}</b>  id=<code>{row['id']}</code>\n"
-                f"{row['name']}\n"
-                f"📦 {row['size_mb']} MB   💾 total: <b>{len(state['items'])}</b>"
-            )
         except Exception as e:
             bad += 1
-            log.error(f"item {item_id} failed: {e}", exc_info=True)
-            tg_send(chat_id,
-                    f"❌ <b>{idx}/{len(todo)}</b> id=<code>{item_id}</code> failed:\n"
-                    f"<code>{str(e)[:250]}</code>")
+            log.error(f"item {iid} failed: {e}", exc_info=True)
+            status[iid] = {"state": "failed", "error": str(e)[:250]}
+
+        # Edit the progress message
+        state = load_state()
+        if progress_msg_id is not None:
+            tg_edit(chat_id, progress_msg_id,
+                    render_progress(page, items, status, len(state["items"])))
+
         time.sleep(ITEM_DELAY)
 
-    tg_send(chat_id, f"🏁 Page <b>{page}</b> done.  ✅ {ok}   ❌ {bad}")
+    # Page done — send JSON file
+    state = load_state()
+    tg_send(
+        chat_id,
+        f"🏁 <b>Page {page} complete</b>\n"
+        f"✅ {ok}   ❌ {bad}   💾 total: <b>{len(state['items'])}</b>"
+    )
+    tg_send_document(chat_id, STATE_FILE,
+                     caption=f"📄 Page {page} done — full {STATE_FILE}")
 
 # ================== UI ==================
 def menu_keyboard(page: int) -> dict:
@@ -319,6 +440,7 @@ def menu_keyboard(page: int) -> dict:
             [
                 {"text": f"▶️ Process Page {page}", "callback_data": "action:process"},
                 {"text": "📊 Status", "callback_data": "action:status"},
+                {"text": "📁 Send JSON", "callback_data": "action:json"},
             ],
         ]
     }
@@ -336,13 +458,14 @@ def menu_text(state: Dict[str, Any]) -> str:
         f"✅ Items saved:   <b>{n}</b>\n"
         f"🕒 Last update:   <b>{last}</b>\n\n"
         f"<i>Next &amp; Process → downloads + uploads every item on the next page, "
-        f"one at a time, and saves each to {STATE_FILE}.</i>"
+        f"one at a time, and sends {STATE_FILE} when the page finishes.</i>"
     )
 
 
 def send_menu(chat_id: int) -> None:
     state = load_state()
-    tg_send(chat_id, menu_text(state), reply_markup=menu_keyboard(state["current_page"]))
+    tg_send(chat_id, menu_text(state),
+            reply_markup=menu_keyboard(state["current_page"]))
 
 
 def edit_menu(chat_id: int, message_id: int) -> None:
@@ -355,9 +478,8 @@ _processing = threading.Event()
 
 
 def start_page_processing(chat_id: int, page: int) -> bool:
-    """Run process_page in a background thread. Returns False if busy."""
     if _processing.is_set():
-        tg_send(chat_id, "⏳ Already processing a page — please wait for it to finish.")
+        tg_send(chat_id, "⏳ Already processing a page — please wait.")
         return False
 
     def worker():
@@ -383,10 +505,11 @@ def handle_message(msg: dict) -> None:
     if text.startswith("/start") or text.startswith("/menu"):
         send_menu(chat_id)
     elif text.startswith("/status"):
-        state = load_state()
-        tg_send(chat_id, menu_text(state))
+        tg_send(chat_id, menu_text(load_state()))
+    elif text.startswith("/json"):
+        tg_send_document(chat_id, STATE_FILE,
+                         caption=f"📁 Current {STATE_FILE}")
     elif text.startswith("/process"):
-        # /process N  → process that page
         parts = text.split()
         if len(parts) == 2 and parts[1].isdigit():
             page = max(1, min(TOTAL_PAGES, int(parts[1])))
@@ -407,6 +530,7 @@ def handle_message(msg: dict) -> None:
                 "Commands:\n"
                 "/start — show menu\n"
                 "/status — show stats\n"
+                "/json — send current vid65.json\n"
                 "/process [N] — process page N (default: current)\n"
                 "/goto N — jump to page N\n"
                 "/help — this message")
@@ -456,12 +580,16 @@ def handle_callback(cb: dict) -> None:
         tg_answer_cb(cb_id, "Status sent")
         tg_send(chat_id, menu_text(load_state()))
 
+    elif data == "action:json":
+        tg_answer_cb(cb_id, "Sending file…")
+        tg_send_document(chat_id, STATE_FILE, caption=f"📁 {STATE_FILE}")
+
     else:
         tg_answer_cb(cb_id)
 
 # ================== MAIN LOOP ==================
 def bot_loop() -> None:
-    log.info("Bot loop started — press Ctrl+C to stop")
+    log.info("Bot loop started — Ctrl+C to stop")
     offset = None
     while True:
         try:
