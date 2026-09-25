@@ -1,23 +1,19 @@
 """
 vid65 scraper — local PC, single file.
 
-Downloads image + video from the API, uploads both to the local
-Telegram Bot API server, saves the returned file_ids to vid65.json.
-
-Handles 403 Forbidden from vidserv.cc / upserv.xyz via:
-  - curl_cffi with Chrome TLS impersonation (bypasses Cloudflare fingerprinting)
-  - realistic browser headers (User-Agent, Referer, Accept-Language, etc.)
-  - retry with exponential backoff + jitter
-  - session/cookie handling
+Per item:
+  1. download image + video
+  2. upload both to the local Telegram Bot API server
+  3. save the returned file_ids into vid65.json
 
 Features:
-  - 10 concurrent downloads (BATCH_SIZE)
-  - resumable: reads vid65.json, skips done ids
+  - 10 concurrent downloads at a time (BATCH_SIZE)
+  - resumable: reads vid65.json at start, skips done ids
   - atomic JSON save after every item
-  - no admin notifications — console logs only
+  - no admin notifications — only console logs
 
 Run:
-    pip install curl_cffi
+    pip install requests
     python scraper.py
 """
 
@@ -26,18 +22,17 @@ import io
 import json
 import time
 import signal
-import random
 import logging
 import threading
 from pathlib import Path
 from typing import Iterator, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from curl_cffi import requests as curl_requests
+import requests
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN  = "6757665465:AAFHhZ6KjY0B62WpiedvVXRJPxAVLjinC6E"
-CHAT_ID    = "5087403859"
+CHAT_ID    = "5087403859"     # upload target (must have /start'd the bot)
 LOCAL_API  = "https://telegram-bot-api-production-29e4.up.railway.app"
 API_URL    = "https://shabbir.serv00.net/sex/vid65/get.php"
 
@@ -45,42 +40,17 @@ START_PAGE = 1
 END_PAGE   = 60
 PAGE_DELAY = 1.0
 BATCH_SIZE = 10
-DOWNLOAD_RETRY = 5
+DOWNLOAD_RETRY = 3
 UPLOAD_RETRY   = 3
 HTTP_TIMEOUT   = 120
-
-# Impersonation profile — chrome124 works well for Cloudflare in 2026
-IMPERSONATE = "chrome124"
 
 JSON_PATH    = Path("vid65.json")
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# Realistic browser headers — Cloudflare checks these first
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
-}
-
-# Referer is critical — Cloudflare rejects requests with no referer
-# Use the domain of the CDN itself as a safe default
-REFERER_MAP = {
-    "vidserv.cc": "https://vidserv.cc/",
-    "upserv.xyz": "https://upserv.xyz/",
-    "desitube.net": "https://desitube.net/",
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; vid65-scraper/1.0)",
+    "Accept": "application/json, */*",
 }
 
 logging.basicConfig(
@@ -100,14 +70,6 @@ def _on_sigint(signum, frame):
 
 
 signal.signal(signal.SIGINT, _on_sigint)
-
-
-# ---------------- SESSION FACTORY ----------------
-def make_session() -> curl_requests.Session:
-    """Create a curl_cffi session with Chrome impersonation + browser headers."""
-    session = curl_requests.Session(impersonate=IMPERSONATE)
-    session.headers.update(BROWSER_HEADERS)
-    return session
 
 
 # ---------------- JSON STORE ----------------
@@ -131,6 +93,7 @@ def save_store(rows: list) -> None:
 
 
 def append_row(row: dict) -> None:
+    """Append one row and flush atomically."""
     rows = load_store()
     rows.append(row)
     save_store(rows)
@@ -143,7 +106,7 @@ def _bot_url(method: str) -> str:
 
 def verify_token() -> None:
     try:
-        r = curl_requests.get(_bot_url("getMe"), timeout=15)
+        r = requests.get(_bot_url("getMe"), timeout=15)
     except Exception as e:
         raise SystemExit(f"Can't reach local Bot API server: {e}")
     try:
@@ -158,13 +121,8 @@ def verify_token() -> None:
 
 # ---------------- API PAGINATION ----------------
 def fetch_page(page: int) -> dict:
-    """Fetch a page of items from the source API (no Cloudflare there)."""
-    r = curl_requests.get(
-        API_URL, params={"page": page},
-        headers=BROWSER_HEADERS,
-        timeout=HTTP_TIMEOUT,
-        impersonate=IMPERSONATE,
-    )
+    r = requests.get(API_URL, params={"page": page},
+                     headers=HEADERS, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
@@ -189,60 +147,23 @@ def iter_pages(start: int, end: int) -> Iterator[tuple[int, list]]:
         time.sleep(PAGE_DELAY)
 
 
-# ---------------- DOWNLOAD (with 403 handling) ----------------
-def _referer_for(url: str) -> str:
-    """Pick a sensible Referer based on the CDN domain."""
-    for domain, ref in REFERER_MAP.items():
-        if domain in url:
-            return ref
-    return "https://www.google.com/"
-
-
+# ---------------- DOWNLOAD ----------------
 def download_to_memory(url: str) -> bytes:
-    """
-    Download a URL into memory with:
-      - Chrome TLS impersonation (bypasses Cloudflare fingerprint checks)
-      - realistic browser headers
-      - per-domain Referer
-      - retry with exponential backoff + jitter
-    """
-    referer = _referer_for(url)
     last: Optional[Exception] = None
-
     for attempt in range(1, DOWNLOAD_RETRY + 1):
         try:
-            session = make_session()
-            session.headers.update({"Referer": referer})
-
-            with session.get(url, stream=True, timeout=HTTP_TIMEOUT) as r:
+            with requests.get(url, stream=True, headers=HEADERS,
+                              timeout=HTTP_TIMEOUT) as r:
                 r.raise_for_status()
                 buf = io.BytesIO()
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         buf.write(chunk)
                 return buf.getvalue()
-
         except Exception as e:
             last = e
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            log.warning(
-                f"download attempt {attempt}/{DOWNLOAD_RETRY} failed "
-                f"[{status or '?'}] {url.split('/')[-1]}: {e}"
-            )
-
-            # On 403: wait longer (Cloudflare rate-limits, needs cooldown)
-            if status == 403:
-                wait = (5 * attempt) + random.uniform(1, 3)
-            # On 429: respect rate limit
-            elif status == 429:
-                wait = (10 * attempt) + random.uniform(2, 5)
-            else:
-                wait = (2 ** attempt) + random.uniform(0.5, 1.5)
-
-            if attempt < DOWNLOAD_RETRY:
-                log.info(f"   ↻ retrying in {wait:.1f}s …")
-                time.sleep(wait)
-
+            log.warning(f"download attempt {attempt} failed: {e}")
+            time.sleep(2 ** attempt)
     raise last  # type: ignore
 
 
@@ -252,8 +173,8 @@ def upload_photo(image_bytes: bytes, filename: str, caption: str):
         try:
             files = {"photo": (filename, image_bytes)}
             data  = {"chat_id": CHAT_ID, "caption": caption[:1024]}
-            r = curl_requests.post(_bot_url("sendPhoto"),
-                                   files=files, data=data, timeout=None)
+            r = requests.post(_bot_url("sendPhoto"),
+                              files=files, data=data, timeout=None)
             r.raise_for_status()
             res = r.json()
             if not res.get("ok"):
@@ -274,8 +195,8 @@ def upload_video(video_bytes: bytes, filename: str, caption: str):
             data  = {"chat_id": CHAT_ID,
                      "caption": caption[:1024],
                      "supports_streaming": "true"}
-            r = curl_requests.post(_bot_url("sendVideo"),
-                                   files=files, data=data, timeout=None)
+            r = requests.post(_bot_url("sendVideo"),
+                              files=files, data=data, timeout=None)
             r.raise_for_status()
             res = r.json()
             if not res.get("ok"):
