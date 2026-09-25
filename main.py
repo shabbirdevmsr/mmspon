@@ -5,14 +5,7 @@ Flow per item:
   download image + video → upload to local Bot API server → get file_ids
   → append to vid65.json → notify admin
 
-Env vars (optional, defaults are baked in):
-  BOT_TOKEN       default: 6757665465:AAHo-0Avmg36zGH5vmHt44Fhl-LehHwfzVw
-  ADMIN_ID        default: 5087403859
-  LOCAL_API       default: https://telegram-bot-api-production-29e4.up.railway.app
-  CHAT_ID         default: ADMIN_ID  (upload target)
-  START_PAGE      default: 1
-  END_PAGE        default: 60
-  PAGE_DELAY      default: 1.0
+Env vars are read from .env (via python-dotenv) or from the process env.
 """
 
 import os
@@ -24,23 +17,24 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 import requests
+from dotenv import load_dotenv
 
-# ---------------- CONFIG ----------------
-BOT_TOKEN  = os.environ.get("BOT_TOKEN",
-    "6757665465:AAHo-0Avmg36zGH5vmHt44Fhl-LehHwfzVw")
-ADMIN_ID   = os.environ.get("ADMIN_ID", "5087403859")
+# ---------------- LOAD ENV ----------------
+load_dotenv()  # reads .env if present
+
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_ID   = os.environ.get("ADMIN_ID", "").strip()
+CHAT_ID    = os.environ.get("CHAT_ID", ADMIN_ID).strip() or ADMIN_ID
 LOCAL_API  = os.environ.get("LOCAL_API",
-    "https://telegram-bot-api-production-29e4.up.railway.app")
-CHAT_ID    = os.environ.get("CHAT_ID", ADMIN_ID)
+    "https://telegram-bot-api-production-29e4.up.railway.app").rstrip("/")
+API_URL    = os.environ.get("API_URL",
+    "https://shabbir.serv00.net/sex/vid65/get.php")
 
 START_PAGE = int(os.environ.get("START_PAGE", "1"))
 END_PAGE   = int(os.environ.get("END_PAGE",   "60"))
 PAGE_DELAY = float(os.environ.get("PAGE_DELAY", "1.0"))
 
-API_URL      = "https://shabbir.serv00.net/sex/vid65/get.php"
-JSON_PATH    = Path("vid65.json")
-DOWNLOAD_DIR = Path("downloads")
-DOWNLOAD_DIR.mkdir(exist_ok=True)
+JSON_PATH = Path(os.environ.get("JSON_PATH", "vid65.json"))
 
 HTTP_TIMEOUT   = 120
 DOWNLOAD_RETRY = 3
@@ -65,19 +59,53 @@ def load_store() -> list:
         try:
             return json.loads(JSON_PATH.read_text(encoding="utf-8"))
         except Exception:
-            log.warning("vid65.json is corrupt, starting fresh")
+            log.warning(f"{JSON_PATH} is corrupt, starting fresh")
     return []
 
 
 def save_store(rows: list) -> None:
-    JSON_PATH.write_text(
-        json.dumps(rows, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = JSON_PATH.with_suffix(JSON_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(rows, indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    tmp.replace(JSON_PATH)   # atomic swap, safe against crashes
 
 
-def already_done(rows: list, item_id: int) -> bool:
-    return any(r.get("id") == item_id for r in rows)
+# ---------------- TELEGRAM HELPERS ----------------
+def _bot_url(method: str) -> str:
+    return f"{LOCAL_API}/bot{BOT_TOKEN}/{method}"
+
+
+def verify_token() -> None:
+    """Fail fast if the token is bad or the local server rejects it."""
+    try:
+        r = requests.get(_bot_url("getMe"), timeout=15)
+    except Exception as e:
+        raise SystemExit(f"Can't reach local Bot API server: {e}")
+
+    try:
+        body = r.json()
+    except Exception:
+        raise SystemExit(f"Local server returned non-JSON: {r.text[:300]}")
+
+    if r.status_code != 200 or not body.get("ok"):
+        raise SystemExit(
+            f"Bot token rejected: HTTP {r.status_code} — {r.text[:300]}"
+        )
+    me = body["result"]
+    log.info(f"Token OK — bot @{me.get('username')} (id={me.get('id')})")
+
+
+def send_message(chat_id, text: str) -> None:
+    try:
+        requests.post(
+            _bot_url("sendMessage"),
+            data={"chat_id": chat_id, "text": text[:4000],
+                  "parse_mode": "HTML"},
+            timeout=30,
+        )
+    except Exception as e:
+        log.warning(f"sendMessage failed: {e}")
 
 
 # ---------------- API PAGINATION ----------------
@@ -118,7 +146,8 @@ def download_to_memory(url: str) -> bytes:
     for attempt in range(1, DOWNLOAD_RETRY + 1):
         try:
             with requests.get(url, stream=True,
-                              headers=HEADERS, timeout=HTTP_TIMEOUT) as r:
+                              headers=HEADERS,
+                              timeout=HTTP_TIMEOUT) as r:
                 r.raise_for_status()
                 buf = io.BytesIO()
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -132,22 +161,9 @@ def download_to_memory(url: str) -> bytes:
     raise last_err  # type: ignore
 
 
-# ---------------- TELEGRAM UPLOAD ----------------
-def _bot_url(method: str) -> str:
-    return f"{LOCAL_API}/bot{BOT_TOKEN}/{method}"
-
-
-def send_message(chat_id, text: str) -> None:
-    try:
-        requests.post(_bot_url("sendMessage"),
-                      data={"chat_id": chat_id, "text": text[:4000],
-                            "parse_mode": "HTML"},
-                      timeout=30)
-    except Exception as e:
-        log.warning(f"sendMessage failed: {e}")
-
-
+# ---------------- UPLOAD ----------------
 def upload_photo(image_bytes: bytes, filename: str, caption: str):
+    """Returns (file_id, message_id)."""
     for attempt in range(1, UPLOAD_RETRY + 1):
         try:
             files = {"photo": (filename, image_bytes)}
@@ -168,6 +184,7 @@ def upload_photo(image_bytes: bytes, filename: str, caption: str):
 
 
 def upload_video(video_bytes: bytes, filename: str, caption: str):
+    """Returns (file_id, message_id). Falls back to document if needed."""
     for attempt in range(1, UPLOAD_RETRY + 1):
         try:
             files = {"video": (filename, video_bytes)}
@@ -235,8 +252,15 @@ def process_item(item: dict) -> dict:
 
 # ---------------- ENTRY ----------------
 def main() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN not set — check your .env or Railway variables.")
+    if not ADMIN_ID:
+        raise SystemExit("ADMIN_ID not set.")
+
+    verify_token()
+
     log.info(f"Bot: {BOT_TOKEN.split(':')[0]} | Admin: {ADMIN_ID} | Chat: {CHAT_ID}")
-    log.info(f"Pages {START_PAGE}..{END_PAGE}")
+    log.info(f"Pages {START_PAGE}..{END_PAGE}  |  Store: {JSON_PATH.resolve()}")
 
     send_message(ADMIN_ID, "🚀 <b>vid65 scraper started</b>")
 
@@ -275,16 +299,20 @@ def main() -> None:
         except Exception as e:
             failed += 1
             log.error(f"[{item_id}] failed: {e}", exc_info=True)
-            send_message(ADMIN_ID,
+            send_message(
+                ADMIN_ID,
                 f"❌ <b>Item failed</b>\n"
                 f"ID: <code>{item_id}</code>\n"
-                f"Error: <code>{str(e)[:300]}</code>")
+                f"Error: <code>{str(e)[:300]}</code>"
+            )
 
-    send_message(ADMIN_ID,
+    send_message(
+        ADMIN_ID,
         f"🏁 <b>Scraper finished</b>\n"
         f"Processed: {processed}\n"
         f"Failed: {failed}\n"
-        f"Total rows: {len(rows)}")
+        f"Total rows: {len(rows)}"
+    )
     log.info(f"Done. processed={processed} failed={failed} total={len(rows)}")
 
 
