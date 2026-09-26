@@ -29,13 +29,13 @@ from typing import Optional, List, Dict, Any
 import requests
 
 # ================== CONFIG ==================
-BOT_TOKEN   = "6757665465:AAFHhZ6KjY0B62WpiedvVXRJPxAVLjinC6E"
+BOT_TOKEN   = "6757665465:AAEG8h6CRtDvm_5tVihxhcOewze9TcrsvwM"
 ADMIN_ID    = 5087403859
 
 STORAGE_CHAT_ID     = "-1003916426485"      # e.g. "-1001234567890" to hide media from admin chat
 DELETE_AFTER_UPLOAD = True
 
-LOCAL_API   = "https://telegram-bot-api-production-29e4.up.railway.app"
+LOCAL_API   = "https://telegram-bot-api-production-2276.up.railway.app"
 API_URL     = "https://shabbir.serv00.net/sex/vid65/get.php"
 
 TOTAL_PAGES = 60
